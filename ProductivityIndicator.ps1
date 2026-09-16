@@ -171,6 +171,75 @@ function Reset-WindowMetrics {
     $script:WindowStartedAt = Get-Date
 }
 
+function Add-RollingUsageSample {
+    param(
+        [string]$Name,
+        [datetime]$Timestamp = (Get-Date)
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Name) -or $Name -eq 'unknown') {
+        return
+    }
+
+    $script:UsageSamples.Enqueue([pscustomobject]@{
+        Name = $Name
+        Timestamp = $Timestamp
+    })
+
+    $cutoff = $Timestamp.AddMinutes(-5)
+    while (
+        $script:UsageSamples.Count -gt 0 -and
+        $script:UsageSamples.Peek().Timestamp -lt $cutoff
+    ) {
+        $script:UsageSamples.Dequeue() | Out-Null
+    }
+}
+
+function Get-RollingUsageTop {
+    param([datetime]$Timestamp = (Get-Date))
+
+    $cutoff = $Timestamp.AddMinutes(-5)
+    while (
+        $script:UsageSamples.Count -gt 0 -and
+        $script:UsageSamples.Peek().Timestamp -lt $cutoff
+    ) {
+        $script:UsageSamples.Dequeue() | Out-Null
+    }
+
+    $usage = @{}
+    foreach ($sample in $script:UsageSamples) {
+        if (-not $usage.ContainsKey($sample.Name)) {
+            $usage[$sample.Name] = 0
+        }
+        $usage[$sample.Name]++
+    }
+
+    return @($usage.GetEnumerator() |
+        Sort-Object @{ Expression = 'Value'; Descending = $true },
+            @{ Expression = 'Name'; Descending = $false } |
+        Select-Object -First 3 |
+        ForEach-Object {
+            [pscustomobject]@{
+                Name = $_.Key
+                Seconds = [int]$_.Value
+            }
+        })
+}
+
+function Format-UsageDuration {
+    param([int]$Seconds)
+
+    if ($Seconds -ge 60) {
+        $minutes = [Math]::Floor($Seconds / 60)
+        $remainingSeconds = $Seconds % 60
+        if ($remainingSeconds -gt 0) {
+            return "${minutes}m ${remainingSeconds}s"
+        }
+        return "${minutes}m"
+    }
+    return "${Seconds}s"
+}
+
 function ConvertTo-DomainList {
     param([string]$Text)
 
@@ -400,6 +469,9 @@ function Add-ActivitySample {
         $script:AppSeconds[$appKey] = 0
     }
     $script:AppSeconds[$appKey]++
+    if ($category -ne 'idle') {
+        Add-RollingUsageSample $appKey
+    }
 
     $point = New-Object ActivityNative+POINT
     if ([ActivityNative]::GetCursorPos([ref]$point)) {
@@ -731,7 +803,7 @@ $mainXaml = @"
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Title="Productivity Indicator"
-        Width="270" Height="184"
+        Width="310" Height="230"
         WindowStyle="None"
         AllowsTransparency="True"
         Background="Transparent"
@@ -752,6 +824,7 @@ $mainXaml = @"
             <Grid.RowDefinitions>
                 <RowDefinition Height="Auto"/>
                 <RowDefinition Height="*"/>
+                <RowDefinition Height="Auto"/>
                 <RowDefinition Height="Auto"/>
             </Grid.RowDefinitions>
 
@@ -812,7 +885,7 @@ $mainXaml = @"
                 </StackPanel>
             </Grid>
 
-            <Grid Grid.Row="2">
+            <StackPanel Grid.Row="2" Margin="0,0,0,8">
                 <ProgressBar x:Name="ScoreBar"
                              Height="5"
                              Minimum="0"
@@ -826,8 +899,33 @@ $mainXaml = @"
                            Foreground="#6B7280"
                            FontSize="9"
                            HorizontalAlignment="Right"
-                           Margin="0,9,0,0"/>
-            </Grid>
+                           Margin="0,4,0,0"/>
+            </StackPanel>
+
+            <StackPanel Grid.Row="3">
+                <TextBlock Text="TOP ACTIVITY - LAST 5 MIN"
+                           Foreground="#6B7280"
+                           FontSize="9"
+                           FontWeight="SemiBold"
+                           Margin="2,0,0,3"/>
+                <UniformGrid Columns="3">
+                    <Border Background="#1F2937" CornerRadius="7" Margin="2,0" Padding="6,5">
+                        <TextBlock x:Name="UsageLabel1" Text="1  --"
+                                   Foreground="#E5E7EB" FontSize="10"
+                                   TextTrimming="CharacterEllipsis"/>
+                    </Border>
+                    <Border Background="#1F2937" CornerRadius="7" Margin="2,0" Padding="6,5">
+                        <TextBlock x:Name="UsageLabel2" Text="2  --"
+                                   Foreground="#E5E7EB" FontSize="10"
+                                   TextTrimming="CharacterEllipsis"/>
+                    </Border>
+                    <Border Background="#1F2937" CornerRadius="7" Margin="2,0" Padding="6,5">
+                        <TextBlock x:Name="UsageLabel3" Text="3  --"
+                                   Foreground="#E5E7EB" FontSize="10"
+                                   TextTrimming="CharacterEllipsis"/>
+                    </Border>
+                </UniformGrid>
+            </StackPanel>
         </Grid>
     </Border>
 </Window>
@@ -841,6 +939,11 @@ $script:ScoreText = $script:Window.FindName('ScoreText')
 $script:StatusText = $script:Window.FindName('StatusText')
 $script:ScoreBar = $script:Window.FindName('ScoreBar')
 $script:NextUpdateText = $script:Window.FindName('NextUpdateText')
+$script:UsageLabels = @(
+    $script:Window.FindName('UsageLabel1'),
+    $script:Window.FindName('UsageLabel2'),
+    $script:Window.FindName('UsageLabel3')
+)
 $settingsButton = $script:Window.FindName('SettingsButton')
 $closeButton = $script:Window.FindName('CloseButton')
 
@@ -852,6 +955,7 @@ $script:LeftMouseDown = $false
 $script:RightMouseDown = $false
 $script:MiddleMouseDown = $false
 $script:BrowserUrlCache = @{}
+$script:UsageSamples = [System.Collections.Generic.Queue[object]]::new()
 Reset-WindowMetrics
 
 function Update-Display {
@@ -866,6 +970,22 @@ function Update-Display {
     $script:ScoreBar.Foreground = ConvertTo-Brush $presentation.Accent
     $script:Card.BorderBrush = ConvertTo-Brush $presentation.Accent
     $script:Window.ToolTip = "Dominant app: $($Result.DominantApp)`nApp context: $($Result.ContextScore)`nInteraction: $($Result.InteractionScore)`nActivity: $($Result.ActivityScore)`nFocus consistency: $($Result.ConsistencyScore)"
+}
+
+function Update-UsageDisplay {
+    $topUsage = @(Get-RollingUsageTop)
+    for ($index = 0; $index -lt $script:UsageLabels.Count; $index++) {
+        $label = $script:UsageLabels[$index]
+        if ($index -lt $topUsage.Count) {
+            $entry = $topUsage[$index]
+            $duration = Format-UsageDuration $entry.Seconds
+            $label.Text = "$($index + 1)  $($entry.Name) - $duration"
+            $label.ToolTip = "$($entry.Name): $duration in the last 5 minutes"
+        } else {
+            $label.Text = "$($index + 1)  --"
+            $label.ToolTip = 'No activity collected yet'
+        }
+    }
 }
 
 if ($SelfTest) {
@@ -908,6 +1028,22 @@ if ($SelfTest) {
     }
     if ((Resolve-ContextCategory 'chrome' 'Video' 'https://youtube.com/watch?v=test') -ne 'distraction') {
         $failures += 'YouTube domain was not classified as distracting.'
+    }
+    $script:UsageSamples.Clear()
+    $usageTestTime = Get-Date
+    1..3 | ForEach-Object { Add-RollingUsageSample 'code' $usageTestTime }
+    1..2 | ForEach-Object { Add-RollingUsageSample 'github.com' $usageTestTime }
+    Add-RollingUsageSample 'outlook' $usageTestTime
+    $usageTop = @(Get-RollingUsageTop $usageTestTime)
+    if ($usageTop.Count -ne 3 -or $usageTop[0].Name -ne 'code' -or $usageTop[1].Name -ne 'github.com') {
+        $failures += 'Rolling usage ranking did not return the expected top applications.'
+    }
+    $script:UsageSamples.Clear()
+    Add-RollingUsageSample 'stale' $usageTestTime.AddMinutes(-6)
+    Add-RollingUsageSample 'current' $usageTestTime
+    $prunedUsage = @(Get-RollingUsageTop $usageTestTime)
+    if ($prunedUsage.Count -ne 1 -or $prunedUsage[0].Name -ne 'current') {
+        $failures += 'Rolling usage did not discard activity older than five minutes.'
     }
 
     if ($failures.Count -gt 0) {
@@ -955,6 +1091,7 @@ $timer = [Windows.Threading.DispatcherTimer]::new()
 $timer.Interval = [TimeSpan]::FromSeconds(1)
 $timer.Add_Tick({
     Add-ActivitySample
+    Update-UsageDisplay
 
     $elapsed = (Get-Date) - $script:WindowStartedAt
     $scoreIntervalSeconds = $script:Settings.ScoreIntervalMinutes * 60

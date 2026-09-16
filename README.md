@@ -9,6 +9,7 @@ A small, always-on-top Windows widget that estimates a productivity score from 0
 - A motivational message selected in 10-point score bands
 - A configurable break reminder, set to 40 minutes by default
 - Active browser-site classification for Chrome, Edge, Firefox, Brave, Opera, and Vivaldi
+- Three compact labels showing the most-used apps or browser sites in the last five minutes
 
 ## Run
 
