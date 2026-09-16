@@ -11,7 +11,7 @@ if ([Threading.Thread]::CurrentThread.ApartmentState -ne 'STA') {
     exit
 }
 
-Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, System.Xaml
+Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, System.Xaml, UIAutomationClient, UIAutomationTypes
 
 Add-Type @"
 using System;
@@ -81,6 +81,20 @@ $script:DefaultSettings = [ordered]@{
     DistractionApps = @(
         'vlc', 'wmplayer', 'moviesandtv', 'spotify', 'netflix',
         'primevideo', 'disneyplus'
+    )
+    BrowserApps = @('chrome', 'msedge', 'firefox', 'brave', 'opera', 'vivaldi')
+    ProductiveDomains = @(
+        'office.com', 'office365.com', 'microsoft365.com', 'microsoft.com',
+        'sharepoint.com', 'teams.microsoft.com', 'outlook.office.com',
+        'dev.azure.com', 'github.com', 'learn.microsoft.com',
+        'docs.microsoft.com', 'portal.azure.com', 'powerbi.com',
+        'powerapps.com', 'dynamics.com'
+    )
+    ProductiveDomainKeywords = @('microsoft')
+    DistractionDomains = @(
+        'youtube.com', 'reddit.com', 'instagram.com', 'facebook.com',
+        'tiktok.com', 'twitter.com', 'x.com', 'twitch.tv',
+        'netflix.com', 'primevideo.com', 'disneyplus.com'
     )
     FocusTitleKeywords = @(
         'documentation', 'docs', 'learn.microsoft', 'github', 'stackoverflow',
@@ -157,6 +171,156 @@ function Reset-WindowMetrics {
     $script:WindowStartedAt = Get-Date
 }
 
+function ConvertTo-DomainList {
+    param([string]$Text)
+
+    return @($Text -split '[,\r\n;]+' |
+        ForEach-Object { $_.Trim().ToLowerInvariant() } |
+        Where-Object { $_ } |
+        Select-Object -Unique)
+}
+
+function Get-NormalizedHost {
+    param([string]$Url)
+
+    if ([string]::IsNullOrWhiteSpace($Url)) { return '' }
+    $candidate = $Url.Trim()
+    if ($candidate -notmatch '^[a-z][a-z0-9+.-]*://') {
+        $candidate = "https://$candidate"
+    }
+
+    try {
+        $uri = [Uri]$candidate
+        if (-not $uri.Host) { return '' }
+        return $uri.Host.TrimEnd('.').ToLowerInvariant()
+    } catch {
+        return ''
+    }
+}
+
+function Test-DomainMatch {
+    param(
+        [string]$HostName,
+        [object[]]$Domains
+    )
+
+    if ([string]::IsNullOrWhiteSpace($HostName)) { return $false }
+    $hostLower = $HostName.TrimEnd('.').ToLowerInvariant()
+    foreach ($configuredDomain in @($Domains)) {
+        $domain = ([string]$configuredDomain).Trim().TrimStart('*', '.').TrimEnd('.').ToLowerInvariant()
+        if (-not $domain) { continue }
+        if ($hostLower -eq $domain -or $hostLower.EndsWith(".$domain")) {
+            return $true
+        }
+    }
+    return $false
+}
+
+function Get-BrowserUrl {
+    param(
+        [IntPtr]$WindowHandle,
+        [string]$WindowTitle
+    )
+
+    if ($WindowHandle -eq [IntPtr]::Zero) { return '' }
+    $cacheKey = [string]$WindowHandle.ToInt64()
+    $now = Get-Date
+    if ($script:BrowserUrlCache.ContainsKey($cacheKey)) {
+        $cached = $script:BrowserUrlCache[$cacheKey]
+        if ($cached.Title -eq $WindowTitle -and ($now - $cached.CheckedAt).TotalSeconds -lt 3) {
+            return $cached.Url
+        }
+    }
+
+    $url = ''
+    try {
+        $root = [System.Windows.Automation.AutomationElement]::FromHandle($WindowHandle)
+        $condition = [System.Windows.Automation.PropertyCondition]::new(
+            [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+            [System.Windows.Automation.ControlType]::Edit
+        )
+        $editControls = $root.FindAll(
+            [System.Windows.Automation.TreeScope]::Descendants,
+            $condition
+        )
+
+        foreach ($control in $editControls) {
+            $name = ([string]$control.Current.Name).ToLowerInvariant()
+            $looksLikeAddressBar = $name -match 'address|location|search.*(web|address)|enter.*address|omnibox'
+            if (-not $looksLikeAddressBar) { continue }
+
+            $pattern = $null
+            if ($control.TryGetCurrentPattern(
+                    [System.Windows.Automation.ValuePattern]::Pattern,
+                    [ref]$pattern
+                )) {
+                $value = ([System.Windows.Automation.ValuePattern]$pattern).Current.Value
+                if (Get-NormalizedHost $value) {
+                    $url = $value
+                    break
+                }
+            }
+        }
+    } catch {
+        $url = ''
+    }
+
+    $script:BrowserUrlCache[$cacheKey] = [pscustomobject]@{
+        Title = $WindowTitle
+        Url = $url
+        CheckedAt = $now
+    }
+    return $url
+}
+
+function Resolve-ContextCategory {
+    param(
+        [string]$ProcessName,
+        [string]$Title,
+        [string]$Url
+    )
+
+    $titleLower = $Title.ToLowerInvariant()
+    $hostName = Get-NormalizedHost $Url
+
+    if ($hostName) {
+        if (Test-DomainMatch $hostName @($script:Settings.DistractionDomains)) {
+            return 'distraction'
+        }
+        if (Test-DomainMatch $hostName @($script:Settings.ProductiveDomains)) {
+            return 'productive'
+        }
+        foreach ($keyword in @($script:Settings.ProductiveDomainKeywords)) {
+            $normalizedKeyword = ([string]$keyword).Trim().ToLowerInvariant()
+            if ($normalizedKeyword -and $hostName.Contains($normalizedKeyword)) {
+                return 'productive'
+            }
+        }
+    }
+
+    if (@($script:Settings.DistractionApps) -contains $ProcessName) {
+        return 'distraction'
+    }
+    if (@($script:Settings.ProductiveApps) -contains $ProcessName) {
+        return 'productive'
+    }
+    if (@($script:Settings.FocusApps) -contains $ProcessName) {
+        return 'focus'
+    }
+
+    foreach ($keyword in @($script:Settings.DistractionTitleKeywords)) {
+        if ($titleLower.Contains(([string]$keyword).ToLowerInvariant())) {
+            return 'distraction'
+        }
+    }
+    foreach ($keyword in @($script:Settings.FocusTitleKeywords)) {
+        if ($titleLower.Contains(([string]$keyword).ToLowerInvariant())) {
+            return 'focus'
+        }
+    }
+    return 'neutral'
+}
+
 function Get-ForegroundContext {
     $window = [ActivityNative]::GetForegroundWindow()
     if ($window -eq [IntPtr]::Zero) {
@@ -175,35 +339,17 @@ function Get-ForegroundContext {
         $processName = 'unknown'
     }
 
-    $titleLower = $title.ToLowerInvariant()
-    $category = 'neutral'
-
-    if (@($script:Settings.DistractionApps) -contains $processName) {
-        $category = 'distraction'
-    } elseif (@($script:Settings.ProductiveApps) -contains $processName) {
-        $category = 'productive'
-    } elseif (@($script:Settings.FocusApps) -contains $processName) {
-        $category = 'focus'
-    } else {
-        foreach ($keyword in @($script:Settings.DistractionTitleKeywords)) {
-            if ($titleLower.Contains(([string]$keyword).ToLowerInvariant())) {
-                $category = 'distraction'
-                break
-            }
-        }
-        if ($category -eq 'neutral') {
-            foreach ($keyword in @($script:Settings.FocusTitleKeywords)) {
-                if ($titleLower.Contains(([string]$keyword).ToLowerInvariant())) {
-                    $category = 'focus'
-                    break
-                }
-            }
-        }
+    $url = ''
+    if (@($script:Settings.BrowserApps) -contains $processName) {
+        $url = Get-BrowserUrl $window $title
     }
+    $category = Resolve-ContextCategory $processName $title $url
 
     return [pscustomobject]@{
         Process = $processName
         Title = $title
+        Url = $url
+        HostName = Get-NormalizedHost $url
         Category = $category
     }
 }
@@ -243,7 +389,13 @@ function Add-ActivitySample {
         $metric.ActiveSeconds += 1
     }
 
-    $appKey = if ($context.Process) { $context.Process } else { 'unknown' }
+    $appKey = if ($context.HostName) {
+        $context.HostName
+    } elseif ($context.Process) {
+        $context.Process
+    } else {
+        'unknown'
+    }
     if (-not $script:AppSeconds.ContainsKey($appKey)) {
         $script:AppSeconds[$appKey] = 0
     }
@@ -432,7 +584,7 @@ function Show-SettingsWindow {
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Title="Productivity Indicator settings"
-        Width="390" Height="300"
+        Width="500" Height="505"
         WindowStartupLocation="CenterScreen"
         ResizeMode="NoResize"
         Background="#111827"
@@ -440,6 +592,8 @@ function Show-SettingsWindow {
         FontFamily="Segoe UI">
     <Grid Margin="24">
         <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
             <RowDefinition Height="Auto"/>
             <RowDefinition Height="Auto"/>
             <RowDefinition Height="Auto"/>
@@ -475,10 +629,26 @@ function Show-SettingsWindow {
 
         <CheckBox x:Name="BreakEnabled" Grid.Row="3"
                   Content="Enable break reminders"
-                  VerticalAlignment="Top" Margin="0,4,0,0"
+                  VerticalAlignment="Top" Margin="0,4,0,14"
                   Foreground="#F9FAFB"/>
 
-        <StackPanel Grid.Row="4" Orientation="Horizontal" HorizontalAlignment="Right">
+        <StackPanel Grid.Row="4" Margin="0,0,0,14">
+            <TextBlock Text="Productive browser domains" FontWeight="SemiBold"/>
+            <TextBlock Text="Comma-separated corporate, Office, development, and work domains."
+                       Foreground="#9CA3AF" FontSize="12" Margin="0,0,0,5"/>
+            <TextBox x:Name="ProductiveDomains" Height="58" Padding="7,5"
+                     AcceptsReturn="True" TextWrapping="Wrap" VerticalScrollBarVisibility="Auto"/>
+        </StackPanel>
+
+        <StackPanel Grid.Row="5" Margin="0,0,0,14">
+            <TextBlock Text="Distracting browser domains" FontWeight="SemiBold"/>
+            <TextBlock Text="Comma-separated social media, video, and entertainment domains."
+                       Foreground="#9CA3AF" FontSize="12" Margin="0,0,0,5"/>
+            <TextBox x:Name="DistractionDomains" Height="58" Padding="7,5"
+                     AcceptsReturn="True" TextWrapping="Wrap" VerticalScrollBarVisibility="Auto"/>
+        </StackPanel>
+
+        <StackPanel Grid.Row="6" Orientation="Horizontal" HorizontalAlignment="Right">
             <Button x:Name="CancelButton" Content="Cancel" Width="80" Height="32" Margin="0,0,8,0"/>
             <Button x:Name="SaveButton" Content="Save" Width="80" Height="32" IsDefault="True"/>
         </StackPanel>
@@ -491,12 +661,16 @@ function Show-SettingsWindow {
     $scoreInterval = $settingsWindow.FindName('ScoreInterval')
     $breakInterval = $settingsWindow.FindName('BreakInterval')
     $breakEnabled = $settingsWindow.FindName('BreakEnabled')
+    $productiveDomains = $settingsWindow.FindName('ProductiveDomains')
+    $distractionDomains = $settingsWindow.FindName('DistractionDomains')
     $saveButton = $settingsWindow.FindName('SaveButton')
     $cancelButton = $settingsWindow.FindName('CancelButton')
 
     $scoreInterval.Text = [string]$script:Settings.ScoreIntervalMinutes
     $breakInterval.Text = [string]$script:Settings.BreakIntervalMinutes
     $breakEnabled.IsChecked = [bool]$script:Settings.BreakReminderEnabled
+    $productiveDomains.Text = @($script:Settings.ProductiveDomains) -join ', '
+    $distractionDomains.Text = @($script:Settings.DistractionDomains) -join ', '
 
     $cancelButton.Add_Click({ $settingsWindow.DialogResult = $false })
     $saveButton.Add_Click({
@@ -529,6 +703,8 @@ function Show-SettingsWindow {
         $script:Settings.ScoreIntervalMinutes = $scoreValue
         $script:Settings.BreakIntervalMinutes = $breakValue
         $script:Settings.BreakReminderEnabled = [bool]$breakEnabled.IsChecked
+        $script:Settings.ProductiveDomains = ConvertTo-DomainList $productiveDomains.Text
+        $script:Settings.DistractionDomains = ConvertTo-DomainList $distractionDomains.Text
         try {
             Save-Settings $script:Settings
         } catch {
@@ -675,6 +851,7 @@ $script:LastCursor = $null
 $script:LeftMouseDown = $false
 $script:RightMouseDown = $false
 $script:MiddleMouseDown = $false
+$script:BrowserUrlCache = @{}
 Reset-WindowMetrics
 
 function Update-Display {
@@ -719,6 +896,18 @@ if ($SelfTest) {
     }
     if ((Get-ScorePresentation 24).Emoji -eq (Get-ScorePresentation 25).Emoji) {
         $failures += 'Emoji boundary at 25 is not distinct.'
+    }
+    if ((Resolve-ContextCategory 'msedge' 'Reddit' 'https://www.reddit.com/r/programming') -ne 'distraction') {
+        $failures += 'Reddit domain was not classified as distracting.'
+    }
+    if ((Resolve-ContextCategory 'chrome' 'Microsoft 365' 'https://contoso.sharepoint.com/sites/work') -ne 'productive') {
+        $failures += 'SharePoint domain was not classified as productive.'
+    }
+    if ((Resolve-ContextCategory 'msedge' 'Internal portal' 'https://microsoftinternal.example.com/work') -ne 'productive') {
+        $failures += 'A domain containing microsoft was not classified as productive.'
+    }
+    if ((Resolve-ContextCategory 'chrome' 'Video' 'https://youtube.com/watch?v=test') -ne 'distraction') {
+        $failures += 'YouTube domain was not classified as distracting.'
     }
 
     if ($failures.Count -gt 0) {
